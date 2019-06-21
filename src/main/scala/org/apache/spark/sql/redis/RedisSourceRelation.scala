@@ -79,6 +79,8 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
   private val logInfoVerbose = parameters.get(SqlOptionLogInfoVerbose).exists(_.toBoolean)
   private val blockSize = parameters.get(SqlOptionBlockSize).map(_.toInt).getOrElse(SqlOptionBlockSizeDefault)
 
+  logInfo(f"Using persistence model: ${persistenceModel}")
+
   /**
     * redis key pattern for rows, based either on the 'keys.pattern' or 'table' parameter
     */
@@ -116,12 +118,12 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
   }
 
   override def insert(data: DataFrame, overwrite: Boolean): Unit = {
+    val stopWatch = new StopWatch()
     val schema = userSpecifiedSchema.getOrElse(data.schema)
     // write schema, so that we can load dataframe back
     currentSchema = saveSchema(schema)
     if (overwrite) {
       // truncate the table
-      val stopWatch = new StopWatch()
       sc.fromRedisKeyPattern(dataKeyPattern).foreachPartition { partition =>
         groupKeysByNode(redisConfig.hosts, partition).foreach { case (node, keys) =>
           val conn = node.connect()
@@ -147,24 +149,32 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
 
   private def writeBlocks(partition: Iterator[Row], schema: StructType): Unit = {
     val kryo = KryoUtils.Pool.borrow()
+    val partId = TaskContext.getPartitionId()
     val fieldNames = schema.fields.map(_.name)
+    var marker = 0.0
     partition.grouped(blockSize).foreach { rows =>
       val stopWatch = new StopWatch()
       val block = rows.map { row =>
         fieldNames.map(f => row.getAs[Any](f))
       }.toArray // convert Seq to Array since we need a Serializable
-
+      if (logInfoVerbose) {
+        marker = stopWatch.getTimeSec()
+        logInfo(f"writeBlocks step(1/3) :: Time taken to convert Seq to Array with block with $blockSize rows in partition $partId: ${marker}%.3f sec")
+      }
       //      val serializedBlock = SerializationUtils.serialize(block)
       val serializedBlock = KryoUtils.serialize(block, kryo)
-
+      if (logInfoVerbose) {
+        logInfo(f"writeBlocks step(2/3) :: Time taken to serialize block with $blockSize rows (${serializedBlock.size} bytes) in partition $partId: ${stopWatch.getTimeSec()-marker}%.3f sec")
+        marker = stopWatch.getTimeSec()
+      }
       val blockKey = dataKey(tableName())
       // TODO: pipeline?
       val conn = redisConfig.connectionForKey(blockKey)
       conn.set(blockKey.getBytes, serializedBlock)
       conn.close()
       if (logInfoVerbose) {
-        val partId = TaskContext.getPartitionId()
-        logInfo(f"Time taken to write 1 block with $blockSize rows in partition $partId: ${stopWatch.getTimeSec()}%.3f sec")
+        logInfo(f"writeBlocks step(3/3) :: Time taken to SET block with $blockSize rows in partition $partId: ${stopWatch.getTimeSec()-marker}%.3f sec")
+        logInfo(f"writeBlocks allSteps :: All steps time with block with $blockSize rows in partition $partId: ${stopWatch.getTimeSec()}%.3f sec")
       }
     }
     KryoUtils.Pool.release(kryo)
