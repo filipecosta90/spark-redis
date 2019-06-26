@@ -1,7 +1,9 @@
 package org.apache.spark.sql.redis
 
+import java.io.ByteArrayOutputStream
 import java.util.UUID
 
+import com.esotericsoftware.kryo.io.Output
 import com.redislabs.provider.redis.rdd.Keys._
 import com.redislabs.provider.redis.util.ConnectionUtils.withConnection
 import com.redislabs.provider.redis.util.PipelineUtils._
@@ -56,12 +58,6 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
   logInfo(s"Redis config initial host: ${redisConfig.initialHost}")
 
   @transient private val sc = sqlContext.sparkContext
-
-  /**
-    * Will be filled while saving data to Redis or reading from Redis.
-    */
-  @volatile private var currentSchema: StructType = _
-
   /** parameters (sorted alphabetically) **/
   private val filterKeysByTypeEnabled = parameters.get(SqlOptionFilterKeysByType).exists(_.toBoolean)
   private val inferSchemaEnabled = parameters.get(SqlOptionInferSchema).exists(_.toBoolean)
@@ -78,9 +74,6 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
   private val ttl = parameters.get(SqlOptionTTL).map(_.toInt).getOrElse(0)
   private val logInfoVerbose = parameters.get(SqlOptionLogInfoVerbose).exists(_.toBoolean)
   private val blockSize = parameters.get(SqlOptionBlockSize).map(_.toInt).getOrElse(SqlOptionBlockSizeDefault)
-
-  logInfo(f"Using persistence model: ${persistenceModel}")
-
   /**
     * redis key pattern for rows, based either on the 'keys.pattern' or 'table' parameter
     */
@@ -91,6 +84,7 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
       throw new IllegalArgumentException(msg)
     }
 
+  logInfo(f"Using persistence model: ${persistenceModel}")
   /**
     * Support key column extraction from Redis prefix pattern. Otherwise,
     * return Redis key unmodified.
@@ -101,6 +95,10 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
     } else {
       ""
     }
+  /**
+    * Will be filled while saving data to Redis or reading from Redis.
+    */
+  @volatile private var currentSchema: StructType = _
 
   // check specified parameters
   if (tableNameOpt.isDefined && keysPatternOpt.isDefined) {
@@ -135,36 +133,74 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
       }
       logInfo(f"Time taken to delete dataframe (SaveMode.Overwrite): ${stopWatch.getTimeSec()}%.3f sec")
     }
+    val fieldNames: Array[String] = schema.fields.map(_.name)
 
     // write data
     data.foreachPartition { partition =>
       persistenceModel match {
         case SqlOptionModelHash => writeRows(partition)
         case SqlOptionModelBinary => writeRows(partition)
-        case SqlOptionModelBlock => writeBlocks(partition, schema)
+        case SqlOptionModelBlock => writeBlocks(partition, fieldNames)
       }
     }
 
+    logInfo(f"Time taken to insert data: ${stopWatch.getTimeSec()}%.3f sec")
+
   }
 
-  private def writeBlocks(partition: Iterator[Row], schema: StructType): Unit = {
+  private def writeBlocks(partition: Iterator[Row], fieldNames: Array[String]): Unit = {
     val kryo = KryoUtils.Pool.borrow()
     val partId = TaskContext.getPartitionId()
-    val fieldNames = schema.fields.map(_.name)
-    var marker = 0.0
+    kryo.addDefaultSerializer(classOf[Row], classOf[RowSerializer])
+    kryo.register(classOf[Row])
+    kryo.register(classOf[GenericRow])
+
+
+
     partition.grouped(blockSize).foreach { rows =>
+      var marker = 0.0
+      val baos = new ByteArrayOutputStream()
+      val output = new Output(baos)
+      output.clear()
       val stopWatch = new StopWatch()
-      val block = rows.map { row =>
-        fieldNames.map(f => row.getAs[Any](f))
-      }.toArray // convert Seq to Array since we need a Serializable
-      if (logInfoVerbose) {
-        marker = stopWatch.getTimeSec()
-        logInfo(f"writeBlocks step(1/3) :: Time taken to convert Seq to Array with block with $blockSize rows in partition $partId: ${marker}%.3f sec")
+      rows.foreach(row => {
+        kryo.writeObject(output, row)
+      })
+
+
+      /* Block 1 to remove
+      check with @fe2s
+
+      val seq: Seq[Array[Any]] = rows.map {
+        row => fieldNames.map(f => row.getAs[Any](f))
       }
-      //      val serializedBlock = SerializationUtils.serialize(block)
-      val serializedBlock = KryoUtils.serialize(block, kryo)
+       if (logInfoVerbose) {
+        marker = stopWatch.getTimeSec()
+        logInfo(f"writeBlocks step(1/4) :: Time taken to convert to Seq with block with $blockSize rows in partition $partId: ${marker}%.3f sec")
+      }
+       */
+
+
+      /* Block 2 to remove
+      check with @fe2s
+
+
+      val block: Array[Array[Any]] = seq.toArray // convert Seq to Array since we need a Serializable
       if (logInfoVerbose) {
-        logInfo(f"writeBlocks step(2/3) :: Time taken to serialize block with $blockSize rows (${serializedBlock.size} bytes) in partition $partId: ${stopWatch.getTimeSec()-marker}%.3f sec")
+        logInfo(f"writeBlocks step(2/4) :: Time taken to convert Seq to Array with block with $blockSize rows in partition $partId: ${stopWatch.getTimeSec()-marker}%.3f sec")
+        marker = stopWatch.getTimeSec()
+
+      }
+       */
+
+      //      val serializedBlock = SerializationUtils.serialize(block)
+      output.flush()
+      output.close()
+      baos.toByteArray
+      val serializedBlock = baos.toByteArray()
+      baos.close()
+      if (logInfoVerbose) {
+        logInfo(f"writeBlocks step(3/4) :: Time taken to serialize block with $blockSize rows (${serializedBlock.size} bytes) in partition $partId: ${stopWatch.getTimeSec() - marker}%.3f sec")
         marker = stopWatch.getTimeSec()
       }
       val blockKey = dataKey(tableName())
@@ -173,10 +209,12 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
       conn.set(blockKey.getBytes, serializedBlock)
       conn.close()
       if (logInfoVerbose) {
-        logInfo(f"writeBlocks step(3/3) :: Time taken to SET block with $blockSize rows in partition $partId: ${stopWatch.getTimeSec()-marker}%.3f sec")
+        logInfo(f"writeBlocks step(4/4) :: Time taken to SET block with $blockSize rows in partition $partId: ${stopWatch.getTimeSec() - marker}%.3f sec")
         logInfo(f"writeBlocks allSteps :: All steps time with block with $blockSize rows in partition $partId: ${stopWatch.getTimeSec()}%.3f sec")
       }
+
     }
+
     KryoUtils.Pool.release(kryo)
   }
 
@@ -200,6 +238,35 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
         logInfo(f"Time taken to write ${batch.size} rows in partition $partId: ${stopWatch.getTimeSec()}%.3f sec")
       }
     }
+  }
+
+  /**
+    * @return redis key for the row
+    */
+  private def dataKeyId(row: Row): String = {
+    val id = keyColumn.map(id => row.getAs[Any](id)).map(_.toString).getOrElse(uuid())
+    dataKey(tableName(), id)
+  }
+
+  /**
+    * write schema to redis
+    */
+  private def saveSchema(schema: StructType): StructType = {
+    val key = schemaKey(tableName())
+    logInfo(s"saving schema $key")
+    val schemaNode = getMasterNode(redisConfig.hosts, key)
+    val conn = schemaNode.connect()
+    val schemaBytes = SerializationUtils.serialize(schema)
+    conn.set(key.getBytes, schemaBytes)
+    conn.close()
+    schema
+  }
+
+  /**
+    * @return table name
+    */
+  private def tableName(): String = {
+    tableNameOpt.getOrElse(throw new IllegalArgumentException(s"Option '$SqlOptionTableName' is not set."))
   }
 
   override def buildScan(requiredColumns: Array[String], filters: Array[Filter]): RDD[Row] = {
@@ -248,16 +315,6 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
   override def unhandledFilters(filters: Array[Filter]): Array[Filter] = filters
 
   /**
-    * @return true if data exists in redis
-    */
-  def isEmpty: Boolean = {
-    val stopWatch = new StopWatch()
-    val isEmpty = sc.fromRedisKeyPattern(dataKeyPattern, partitionNum = numPartitions).isEmpty()
-    logInfo(f"Time taken to check if keys exist for pattern $dataKeyPattern: ${stopWatch.getTimeSec()}%.3f sec")
-    isEmpty
-  }
-
-  /**
     * @return true if no data exists in redis
     */
   def nonEmpty: Boolean = {
@@ -265,18 +322,13 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
   }
 
   /**
-    * @return table name
+    * @return true if data exists in redis
     */
-  private def tableName(): String = {
-    tableNameOpt.getOrElse(throw new IllegalArgumentException(s"Option '$SqlOptionTableName' is not set."))
-  }
-
-  /**
-    * @return redis key for the row
-    */
-  private def dataKeyId(row: Row): String = {
-    val id = keyColumn.map(id => row.getAs[Any](id)).map(_.toString).getOrElse(uuid())
-    dataKey(tableName(), id)
+  def isEmpty: Boolean = {
+    val stopWatch = new StopWatch()
+    val isEmpty = sc.fromRedisKeyPattern(dataKeyPattern, partitionNum = numPartitions).isEmpty()
+    logInfo(f"Time taken to check if keys exist for pattern $dataKeyPattern: ${stopWatch.getTimeSec()}%.3f sec")
+    isEmpty
   }
 
   /**
@@ -299,20 +351,6 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
         StructType(fields)
       }
     }
-  }
-
-  /**
-    * write schema to redis
-    */
-  private def saveSchema(schema: StructType): StructType = {
-    val key = schemaKey(tableName())
-    logInfo(s"saving schema $key")
-    val schemaNode = getMasterNode(redisConfig.hosts, key)
-    val conn = schemaNode.connect()
-    val schemaBytes = SerializationUtils.serialize(schema)
-    conn.set(key.getBytes, schemaBytes)
-    conn.close()
-    schema
   }
 
   /**
@@ -362,11 +400,13 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
       // TODO: optimize .count() operation
       def readBlocks(): Seq[Row] = {
         val kryo = KryoUtils.Pool.borrow()
+
         // TODO:
         def project(arr: Array[Any], persistedSchema: StructType, requiredSchema: StructType): Array[Any] = {
           val values = persistedSchema.fields.zip(arr).toMap
           requiredSchema.fields.map(f => values(f))
         }
+
         val sw1 = new StopWatch()
         val pipelineValues = mapWithPipeline(conn, filteredKeys) { (pipeline, key) =>
           pipeline.get(key.getBytes)
