@@ -1,6 +1,5 @@
 package org.apache.spark.sql.redis
 
-import java.io.ByteArrayOutputStream
 import java.util.UUID
 
 import com.esotericsoftware.kryo.io.Output
@@ -74,6 +73,10 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
   private val ttl = parameters.get(SqlOptionTTL).map(_.toInt).getOrElse(0)
   private val logInfoVerbose = parameters.get(SqlOptionLogInfoVerbose).exists(_.toBoolean)
   private val blockSize = parameters.get(SqlOptionBlockSize).map(_.toInt).getOrElse(SqlOptionBlockSizeDefault)
+  private val kryoBufferSize =  parameters.get(SqlOptionRedisKryoSerializerBufferSizeMB).map(_.toInt).getOrElse(SqlOptionRedisKryoSerializerBufferSizeMBDefault) * 1024 * 1024
+  logInfo(f"Using kryoBufferSize of: ${kryoBufferSize} bytes")
+
+
   /**
     * redis key pattern for rows, based either on the 'keys.pattern' or 'table' parameter
     */
@@ -117,6 +120,7 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
 
   override def insert(data: DataFrame, overwrite: Boolean): Unit = {
     val stopWatch = new StopWatch()
+
     val schema = userSpecifiedSchema.getOrElse(data.schema)
     // write schema, so that we can load dataframe back
     currentSchema = saveSchema(schema)
@@ -133,14 +137,17 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
       }
       logInfo(f"Time taken to delete dataframe (SaveMode.Overwrite): ${stopWatch.getTimeSec()}%.3f sec")
     }
-    val fieldNames: Array[String] = schema.fields.map(_.name)
 
     // write data
     data.foreachPartition { partition =>
       persistenceModel match {
         case SqlOptionModelHash => writeRows(partition)
         case SqlOptionModelBinary => writeRows(partition)
-        case SqlOptionModelBlock => writeBlocks(partition, fieldNames)
+        case SqlOptionModelBlock => {
+
+          writeBlocks(partition, schema)
+
+        }
       }
     }
 
@@ -148,63 +155,33 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
 
   }
 
-  private def writeBlocks(partition: Iterator[Row], fieldNames: Array[String]): Unit = {
+  private def writeBlocks(partition: Iterator[Row], schema:StructType): Unit = {
+    val stopWatchWriteBlocks = new StopWatch()
     val kryo = KryoUtils.Pool.borrow()
-    val partId = TaskContext.getPartitionId()
-    kryo.addDefaultSerializer(classOf[Row], classOf[RowSerializer])
+    kryo.addDefaultSerializer(classOf[Row], new RowSerializer(schema))
     kryo.register(classOf[Row])
     kryo.register(classOf[GenericRow])
+    val partId = TaskContext.getPartitionId()
+    val serializer = new RowSerializer(schema)
 
-
+    val output = new Output(kryoBufferSize)
 
     partition.grouped(blockSize).foreach { rows =>
-      var marker = 0.0
-      val baos = new ByteArrayOutputStream()
-      val output = new Output(baos)
-      output.clear()
       val stopWatch = new StopWatch()
+      var marker = 0.0
+      output.setPosition(0)
       rows.foreach(row => {
-        kryo.writeObject(output, row)
+        kryo.writeObject(output, row )
       })
-
-
-      /* Block 1 to remove
-      check with @fe2s
-
-      val seq: Seq[Array[Any]] = rows.map {
-        row => fieldNames.map(f => row.getAs[Any](f))
-      }
-       if (logInfoVerbose) {
-        marker = stopWatch.getTimeSec()
-        logInfo(f"writeBlocks step(1/4) :: Time taken to convert to Seq with block with $blockSize rows in partition $partId: ${marker}%.3f sec")
-      }
-       */
-
-
-      /* Block 2 to remove
-      check with @fe2s
-
-
-      val block: Array[Array[Any]] = seq.toArray // convert Seq to Array since we need a Serializable
-      if (logInfoVerbose) {
-        logInfo(f"writeBlocks step(2/4) :: Time taken to convert Seq to Array with block with $blockSize rows in partition $partId: ${stopWatch.getTimeSec()-marker}%.3f sec")
-        marker = stopWatch.getTimeSec()
-
-      }
-       */
-
-      //      val serializedBlock = SerializationUtils.serialize(block)
       output.flush()
-      output.close()
-      baos.toByteArray
-      val serializedBlock = baos.toByteArray()
-      baos.close()
+      val serializedBlock = output.toBytes
+
       if (logInfoVerbose) {
-        logInfo(f"writeBlocks step(3/4) :: Time taken to serialize block with $blockSize rows (${serializedBlock.size} bytes) in partition $partId: ${stopWatch.getTimeSec() - marker}%.3f sec")
+        logInfo(f"writeBlocks step(3/4) :: Time taken to serialize block with $blockSize rows (${serializedBlock.size} bytes) in partition $partId: ${stopWatch.getTimeSec()}%.3f sec")
         marker = stopWatch.getTimeSec()
       }
-      val blockKey = dataKey(tableName())
       // TODO: pipeline?
+      val blockKey = dataKey(tableName())
       val conn = redisConfig.connectionForKey(blockKey)
       conn.set(blockKey.getBytes, serializedBlock)
       conn.close()
@@ -214,8 +191,14 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
       }
 
     }
-
+    output.close()
     KryoUtils.Pool.release(kryo)
+
+    if (logInfoVerbose) {
+      logInfo(f"writeBlocks ALL blocks: ${stopWatchWriteBlocks.getTimeSec()}%.3f sec")
+    }
+
+
   }
 
   private def writeRows(partition: Iterator[Row]): Unit = {
