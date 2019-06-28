@@ -6,23 +6,23 @@ import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.expressions.GenericRowWithSchema
 import org.apache.spark.sql.types._
 
-class RowSerializer(var s:StructType)  extends Serializer[Row] {
+class RowSerializer(var s: StructType) extends Serializer[Row] {
+
   var schema = s
-  var dtypes_size = 0
   var dataTypes = new Array[DataType](0)
-  if ( s!=null){
+  if (s != null) {
     dataTypes = new Array[DataType](schema.size)
     var pos = 0
-    schema.foreach{ field: StructField => {
+    schema.foreach { field: StructField => {
       dataTypes(pos) = field.dataType
       pos += 1
     }
     }
   }
 
-
   // TODO: assess with Oleksiy (@fe2s) if the datatTypes are all covered
   override def write(kryo: Kryo, output: Output, t: Row): Unit = {
+
     // write the number of fields
     output.writeInt(t.size)
 
@@ -38,12 +38,16 @@ class RowSerializer(var s:StructType)  extends Serializer[Row] {
         case LongType => output.writeLong(t.getAs[Long](i))
         case FloatType => output.writeFloat(t.getAs[Float](i))
         case DoubleType => output.writeDouble(t.getAs[Double](i))
+        case _ => kryo.writeClassAndObject(output, t.get(i))
       }
-      //kryo.writeObject(output,t.get(i) )
     }
+
+
   }
 
   override def read(kryo: Kryo, input: Input, aClass: Class[Row]): Row = {
+
+    // read the number of fields
     val size = input.readInt()
     val cols = new Array[Any](size)
 
@@ -51,17 +55,19 @@ class RowSerializer(var s:StructType)  extends Serializer[Row] {
 
       dataTypes(fieldnum) match {
         case StringType => cols(fieldnum) = input.readString()
-        case BooleanType =>  cols(fieldnum) = input.readBoolean()
+        case BooleanType => cols(fieldnum) = input.readBoolean()
         case ByteType => cols(fieldnum) = input.readByte()
         case ShortType => cols(fieldnum) = input.readShort()
         case IntegerType => cols(fieldnum) = input.readInt()
         case LongType => cols(fieldnum) = input.readLong()
         case FloatType => cols(fieldnum) = input.readFloat()
         case DoubleType => cols(fieldnum) = input.readDouble()
+        case _ => cols(fieldnum) = kryo.readClassAndObject(input)
       }
     }
 
-    var newRow: Row = new GenericRowWithSchema( cols, schema )
+
+    var newRow: Row = new GenericRowWithSchema(cols, schema)
     newRow
   }
 }

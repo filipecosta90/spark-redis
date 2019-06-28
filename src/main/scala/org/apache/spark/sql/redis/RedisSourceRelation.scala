@@ -165,9 +165,10 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
     val serializer = new RowSerializer(schema)
 
     val output = new Output(kryoBufferSize)
-
     partition.grouped(blockSize).foreach { rows =>
       val stopWatch = new StopWatch()
+      output.setPosition(0)
+
       var marker = 0.0
       output.setPosition(0)
       rows.foreach(row => {
@@ -189,7 +190,6 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
         logInfo(f"writeBlocks step(4/4) :: Time taken to SET block with $blockSize rows in partition $partId: ${stopWatch.getTimeSec() - marker}%.3f sec")
         logInfo(f"writeBlocks allSteps :: All steps time with block with $blockSize rows in partition $partId: ${stopWatch.getTimeSec()}%.3f sec")
       }
-
     }
     output.close()
     KryoUtils.Pool.release(kryo)
