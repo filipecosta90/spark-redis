@@ -2,7 +2,7 @@ package org.apache.spark.sql.redis
 
 import java.util.UUID
 
-import com.esotericsoftware.kryo.io.Output
+import com.esotericsoftware.kryo.io.{Input, Output}
 import com.redislabs.provider.redis.rdd.Keys._
 import com.redislabs.provider.redis.util.ConnectionUtils.withConnection
 import com.redislabs.provider.redis.util.PipelineUtils._
@@ -73,7 +73,7 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
   private val ttl = parameters.get(SqlOptionTTL).map(_.toInt).getOrElse(0)
   private val logInfoVerbose = parameters.get(SqlOptionLogInfoVerbose).exists(_.toBoolean)
   private val blockSize = parameters.get(SqlOptionBlockSize).map(_.toInt).getOrElse(SqlOptionBlockSizeDefault)
-  private val kryoBufferSize =  parameters.get(SqlOptionRedisKryoSerializerBufferSizeMB).map(_.toInt).getOrElse(SqlOptionRedisKryoSerializerBufferSizeMBDefault) * 1024 * 1024
+  private val kryoBufferSize = parameters.get(SqlOptionRedisKryoSerializerBufferSizeMB).map(_.toInt).getOrElse(SqlOptionRedisKryoSerializerBufferSizeMBDefault) * 1024 * 1024
   logInfo(f"Using kryoBufferSize of: ${kryoBufferSize} bytes")
 
 
@@ -154,7 +154,6 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
     logInfo(f"Time taken to insert data: ${stopWatch.getTimeSec()}%.3f sec")
 
   }
-
   private def writeBlocks(partition: Iterator[Row], schema:StructType): Unit = {
     val stopWatchWriteBlocks = new StopWatch()
     val kryo = KryoUtils.Pool.borrow()
@@ -164,19 +163,22 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
     val partId = TaskContext.getPartitionId()
     val serializer = new RowSerializer(schema)
 
-    val output = new Output(kryoBufferSize)
+
     partition.grouped(blockSize).foreach { rows =>
       val stopWatch = new StopWatch()
-      output.setPosition(0)
-
       var marker = 0.0
+      var output = new Output(kryoBufferSize)
       output.setPosition(0)
+      //save the number of row in that block
+
+      output.writeVarInt(rows.length,true)
+      logInfo(f"writting ${rows.length} Rows in key")
       rows.foreach(row => {
         kryo.writeObject(output, row )
       })
       output.flush()
       val serializedBlock = output.toBytes
-
+      output.close()
       if (logInfoVerbose) {
         logInfo(f"writeBlocks step(3/4) :: Time taken to serialize block with $blockSize rows (${serializedBlock.size} bytes) in partition $partId: ${stopWatch.getTimeSec()}%.3f sec")
         marker = stopWatch.getTimeSec()
@@ -191,7 +193,6 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
         logInfo(f"writeBlocks allSteps :: All steps time with block with $blockSize rows in partition $partId: ${stopWatch.getTimeSec()}%.3f sec")
       }
     }
-    output.close()
     KryoUtils.Pool.release(kryo)
 
     if (logInfoVerbose) {
@@ -232,6 +233,13 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
   }
 
   /**
+    * @return table name
+    */
+  private def tableName(): String = {
+    tableNameOpt.getOrElse(throw new IllegalArgumentException(s"Option '$SqlOptionTableName' is not set."))
+  }
+
+  /**
     * write schema to redis
     */
   private def saveSchema(schema: StructType): StructType = {
@@ -243,13 +251,6 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
     conn.set(key.getBytes, schemaBytes)
     conn.close()
     schema
-  }
-
-  /**
-    * @return table name
-    */
-  private def tableName(): String = {
-    tableNameOpt.getOrElse(throw new IllegalArgumentException(s"Option '$SqlOptionTableName' is not set."))
   }
 
   override def buildScan(requiredColumns: Array[String], filters: Array[Filter]): RDD[Row] = {
@@ -370,7 +371,7 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
           keys
         }
 
-      def readRows() = {
+      def readRows(): Seq[Row] = {
         val pipelineValues = mapWithPipeline(conn, filteredKeys) { (pipeline, key) =>
           persistence.load(pipeline, key, requiredColumns)
         }
@@ -382,39 +383,88 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
 
       // TODO: optimize .count() operation
       def readBlocks(): Seq[Row] = {
+        var finalSeq: Seq[Row] = Seq()
         val kryo = KryoUtils.Pool.borrow()
+        kryo.addDefaultSerializer(classOf[Row], new RowSerializer(schema))
+        kryo.register(classOf[Row])
+        kryo.register(classOf[GenericRow])
 
         // TODO:
-        def project(arr: Array[Any], persistedSchema: StructType, requiredSchema: StructType): Array[Any] = {
-          val values = persistedSchema.fields.zip(arr).toMap
-          requiredSchema.fields.map(f => values(f))
+        def project(fullRow: Row, persistedSchema: StructType, requiredSchema: StructType): Row = {
+          if (persistedSchema.equals(requiredSchema)) {
+            fullRow
+          } else {
+            var cols = new Array[Any](requiredSchema.size)
+            cols = fullRow.getValuesMap(requiredSchema.fieldNames).values.toArray
+            new GenericRow(cols)
+          }
         }
 
+
         val sw1 = new StopWatch()
-        val pipelineValues = mapWithPipeline(conn, filteredKeys) { (pipeline, key) =>
+        val pipelineValues : Seq[Array[Byte]] = mapWithPipeline(conn, filteredKeys) { (pipeline, key) =>
           pipeline.get(key.getBytes)
-        }
+        }.asInstanceOf[Seq[Array[Byte]]]
         logInfo(f"Time taken to read bytes from Redis: ${sw1.getTimeSec()}%.3f sec")
         val sw2 = new StopWatch()
         val persistedSchema = schema
-        val swKryo = new StopWatchAdv
-        val res = pipelineValues.flatMap { v =>
-          val serializedBlock = v.asInstanceOf[Array[Byte]]
-          // val block = SerializationUtils.deserialize[Array[Array[Any]]](serializedBlock)
-          swKryo.start()
-          val block: Array[Array[Any]] = KryoUtils.deserializeTwoDimArray(serializedBlock, kryo)
-          swKryo.stop()
+        pipelineValues.foreach(bytes => {
+          if ( bytes.length > 0 ) {
+            val swKryo = new StopWatch()
+            val input = new Input(bytes)
+            input.setPosition(0)
+            var numRows = input.readInt(true)
+                        logInfo(f"reading ${numRows} rows from redis with available bytes ${input.available}")
+            for (rowNumber <- 0 to numRows - 1) {
+              val row = project( kryo.readObject(input, classOf[Row]), persistedSchema, requiredSchema)
+              finalSeq :+ row
+            }
+            input.close()
+            logInfo(f"Time taken to deserialize blocks to objects (Kryo time): ${swKryo.getTimeSec()}%.3f sec")
 
-          block.map { arr =>
-            val requiredArr = project(arr, persistedSchema, requiredSchema)
-            new GenericRow(requiredArr)
           }
         }
-        logInfo(f"Time taken to deserialize blocks to objects (Kryo time): ${swKryo.getTimeSec()}%.3f sec")
-        logInfo(f"Time taken to deserialize and convert to Row: ${sw2.getTimeSec()}%.3f sec")
-        KryoUtils.Pool.release(kryo)
-        res
+        )
+
+        logInfo(f"Time taken to deserialize all pipelined blocks: ${sw2.getTimeSec()}%.3f sec")
+
+//        val sw1 = new StopWatch()
+//        filteredKeys.foreach( key => {
+//         val bytes: Array[Byte] = conn.get(key.getBytes)
+////          logInfo(f"Key ${key} has ${bytes.length} bytes")
+//          if ( bytes.length > 0 ){
+//            val input = new Input(bytes)
+//            input.setPosition(0)
+//            var numRows = input.readInt(true)
+////            logInfo(f"reading ${numRows} rows from redis key ${key} with available bytes ${input.available}")
+//            for ( rowNumber <- 0 to numRows - 1){
+//              val row = kryo.readObject(input, classOf[Row])
+//              finalSeq :+ row
+//            }
+//            input.close()
+//          }
+//
+//        })
+          KryoUtils.Pool.release(kryo)
+          finalSeq
+
       }
+
+
+      //
+      //
+      //        val res = pipelineValues.map { v =>
+      //          val serializedBlock = v.asInstanceOf[Array[Byte]]
+      //          v.asInstanceOf[Array[Byte]].map(bytes => {
+      //            val input = new Input(bytes)
+      //            project( kryo.readObject(input, classOf[Row] ), persistedSchema, requiredSchema )
+      //          })
+      //        }
+      //        logInfo(f"Time taken to deserialize blocks to objects (Kryo time): ${swKryo.getTimeSec()}%.3f sec")
+      //        logInfo(f"Time taken to deserialize and convert to Row: ${sw2.getTimeSec()}%.3f sec")
+      //        KryoUtils.Pool.release(kryo)
+      //        res
+      //      }
 
       persistenceModel match {
         case SqlOptionModelHash => readRows()

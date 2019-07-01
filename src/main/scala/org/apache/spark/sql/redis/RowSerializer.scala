@@ -24,7 +24,7 @@ class RowSerializer(var s: StructType) extends Serializer[Row] {
   override def write(kryo: Kryo, output: Output, t: Row): Unit = {
 
     // write the number of fields
-    output.writeInt(t.size)
+    output.writeInt(t.length)
 
     for (i <- 0 to t.length - 1) {
 
@@ -51,7 +51,7 @@ class RowSerializer(var s: StructType) extends Serializer[Row] {
     val size = input.readInt()
     val cols = new Array[Any](size)
 
-    for (fieldnum <- 0 to size - 1) {
+    for (fieldnum <- 0 to (size - 1 ) ) {
 
       dataTypes(fieldnum) match {
         case StringType => cols(fieldnum) = input.readString()
