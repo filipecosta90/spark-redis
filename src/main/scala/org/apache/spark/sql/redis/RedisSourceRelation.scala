@@ -154,15 +154,14 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
     logInfo(f"Time taken to insert data: ${stopWatch.getTimeSec()}%.3f sec")
 
   }
-  private def writeBlocks(partition: Iterator[Row], schema:StructType): Unit = {
+
+  private def writeBlocks(partition: Iterator[Row], schema: StructType): Unit = {
     val stopWatchWriteBlocks = new StopWatch()
     val kryo = KryoUtils.Pool.borrow()
-    kryo.addDefaultSerializer(classOf[Row], new RowSerializer(schema))
-    kryo.register(classOf[Row])
-    kryo.register(classOf[GenericRow])
+    kryo.addDefaultSerializer(RowClass, new RowSerializer(schema))
+    kryo.register(RowClass)
+    kryo.register(GenericRowClass)
     val partId = TaskContext.getPartitionId()
-    val serializer = new RowSerializer(schema)
-
 
     partition.grouped(blockSize).foreach { rows =>
       val stopWatch = new StopWatch()
@@ -171,11 +170,11 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
       output.setPosition(0)
       //save the number of row in that block
 
-      output.writeVarInt(rows.length,true)
+      output.writeVarInt(rows.length, true)
       logInfo(f"writting ${rows.length} Rows in key")
-      rows.foreach(row => {
-        kryo.writeObject(output, row )
-      })
+      rows.foreach { row =>
+        kryo.writeObject(output, row)
+      }
       output.flush()
       val serializedBlock = output.toBytes
       output.close()
@@ -198,7 +197,6 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
     if (logInfoVerbose) {
       logInfo(f"writeBlocks ALL blocks: ${stopWatchWriteBlocks.getTimeSec()}%.3f sec")
     }
-
 
   }
 
@@ -383,71 +381,69 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
 
       // TODO: optimize .count() operation
       def readBlocks(): Seq[Row] = {
-        var finalSeq: Seq[Row] = Seq()
+        var finalRowsList: List[Row] = List()
         val kryo = KryoUtils.Pool.borrow()
-        kryo.addDefaultSerializer(classOf[Row], new RowSerializer(schema))
-        kryo.register(classOf[Row])
-        kryo.register(classOf[GenericRow])
+        kryo.addDefaultSerializer(RowClass, new RowSerializer(schema))
+        kryo.register(RowClass)
+        kryo.register(GenericRowClass)
 
         // TODO:
-        def project(fullRow: Row, persistedSchema: StructType, requiredSchema: StructType): Row = {
-          if (persistedSchema.equals(requiredSchema)) {
-            fullRow
-          } else {
-            var cols = new Array[Any](requiredSchema.size)
-            cols = fullRow.getValuesMap(requiredSchema.fieldNames).values.toArray
-            new GenericRow(cols)
-          }
+        def project(fullRow: Row, requiredSchema: StructType): Row = {
+          val cols: Array[Any] = fullRow.getValuesMap(requiredSchema.fieldNames).values.toArray
+          new GenericRow(cols)
         }
 
-
         val sw1 = new StopWatch()
-        val pipelineValues : Seq[Array[Byte]] = mapWithPipeline(conn, filteredKeys) { (pipeline, key) =>
+        val pipelineValues: Seq[Array[Byte]] = mapWithPipeline(conn, filteredKeys) { (pipeline, key) =>
           pipeline.get(key.getBytes)
         }.asInstanceOf[Seq[Array[Byte]]]
         logInfo(f"Time taken to read bytes from Redis: ${sw1.getTimeSec()}%.3f sec")
         val sw2 = new StopWatch()
         val persistedSchema = schema
-        pipelineValues.foreach(bytes => {
-          if ( bytes.length > 0 ) {
+        val projectionRequired = persistedSchema != requiredSchema
+        pipelineValues.foreach { bytes =>
+          if (bytes.length > 0) {
             val swKryo = new StopWatch()
             val input = new Input(bytes)
             input.setPosition(0)
             var numRows = input.readInt(true)
-                        logInfo(f"reading ${numRows} rows from redis with available bytes ${input.available}")
-            for (rowNumber <- 0 to numRows - 1) {
-              val row = project( kryo.readObject(input, classOf[Row]), persistedSchema, requiredSchema)
-              finalSeq :+ row
+            logInfo(f"reading $numRows rows from redis with available bytes ${input.available}")
+            for (rowNumber <- 0 until numRows) {
+              val deserializedRow = kryo.readObject(input, RowClass)
+              val row = if (projectionRequired) {
+                project(deserializedRow, requiredSchema)
+              } else {
+                deserializedRow
+              }
+              finalRowsList = deserializedRow :: finalRowsList
             }
             input.close()
             logInfo(f"Time taken to deserialize blocks to objects (Kryo time): ${swKryo.getTimeSec()}%.3f sec")
-
           }
         }
-        )
+
 
         logInfo(f"Time taken to deserialize all pipelined blocks: ${sw2.getTimeSec()}%.3f sec")
 
-//        val sw1 = new StopWatch()
-//        filteredKeys.foreach( key => {
-//         val bytes: Array[Byte] = conn.get(key.getBytes)
-////          logInfo(f"Key ${key} has ${bytes.length} bytes")
-//          if ( bytes.length > 0 ){
-//            val input = new Input(bytes)
-//            input.setPosition(0)
-//            var numRows = input.readInt(true)
-////            logInfo(f"reading ${numRows} rows from redis key ${key} with available bytes ${input.available}")
-//            for ( rowNumber <- 0 to numRows - 1){
-//              val row = kryo.readObject(input, classOf[Row])
-//              finalSeq :+ row
-//            }
-//            input.close()
-//          }
-//
-//        })
-          KryoUtils.Pool.release(kryo)
-          finalSeq
-
+        //        val sw1 = new StopWatch()
+        //        filteredKeys.foreach( key => {
+        //         val bytes: Array[Byte] = conn.get(key.getBytes)
+        ////          logInfo(f"Key ${key} has ${bytes.length} bytes")
+        //          if ( bytes.length > 0 ){
+        //            val input = new Input(bytes)
+        //            input.setPosition(0)
+        //            var numRows = input.readInt(true)
+        ////            logInfo(f"reading ${numRows} rows from redis key ${key} with available bytes ${input.available}")
+        //            for ( rowNumber <- 0 to numRows - 1){
+        //              val row = kryo.readObject(input, classOf[Row])
+        //              finalRowsList :+ row
+        //            }
+        //            input.close()
+        //          }
+        //
+        //        })
+        KryoUtils.Pool.release(kryo)
+        finalRowsList
       }
 
 
@@ -478,6 +474,9 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
 }
 
 object RedisSourceRelation {
+
+  val RowClass: Class[Row] = classOf[Row]
+  val GenericRowClass: Class[GenericRow] = classOf[GenericRow]
 
   def schemaKey(tableName: String): String = s"_spark:$tableName:schema"
 
