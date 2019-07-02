@@ -415,7 +415,7 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
               } else {
                 deserializedRow
               }
-              finalRowsList = deserializedRow :: finalRowsList
+              finalRowsList = row :: finalRowsList
             }
             input.close()
             logInfo(f"Time taken to deserialize blocks to objects (Kryo time): ${swKryo.getTimeSec()}%.3f sec")
