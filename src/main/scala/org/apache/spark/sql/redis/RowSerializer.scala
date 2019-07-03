@@ -9,6 +9,7 @@ import org.apache.spark.sql.types._
 class RowSerializer(val schema: StructType) extends Serializer[Row] {
 
   val dataTypes: Array[DataType] = schema.fields.map(_.dataType)
+  val nullableRows: Array[Boolean] = schema.fields.map(_.nullable)
 
   // TODO: assess with Oleksiy (@fe2s) if the datatTypes are all covered
   override def write(kryo: Kryo, output: Output, t: Row): Unit = {
@@ -17,19 +18,26 @@ class RowSerializer(val schema: StructType) extends Serializer[Row] {
     output.writeInt(t.length)
 
     for (i <- 0 until t.length) {
-
-      dataTypes(i) match {
-
-        case StringType => output.writeString(t.getAs[String](i))
-        case BooleanType => output.writeBoolean(t.getAs[Boolean](i))
-        case ByteType => output.writeByte(t.getAs[Byte](i))
-        case ShortType => output.writeShort(t.getAs[Short](i))
-        case IntegerType => output.writeInt(t.getAs[Int](i))
-        case LongType => output.writeLong(t.getAs[Long](i))
-        case FloatType => output.writeFloat(t.getAs[Float](i))
-        case DoubleType => output.writeDouble(t.getAs[Double](i))
-        case _ => kryo.writeClassAndObject(output, t.get(i))
+      //if the column is allowed to be null
+      if (nullableRows(i)) {
+        output.writeByte(if (t.isNullAt(i)) 1 else 0)
       }
+      if (!t.isNullAt(i) ){
+        dataTypes(i) match {
+          case StringType => output.writeString(t.getAs[String](i))
+          case BooleanType => output.writeBoolean(t.getAs[Boolean](i))
+          case ByteType => output.writeByte(t.getAs[Byte](i))
+          case ShortType => output.writeShort(t.getAs[Short](i))
+          case IntegerType => output.writeInt(t.getAs[Int](i))
+          case LongType => output.writeLong(t.getAs[Long](i))
+          case FloatType => output.writeFloat(t.getAs[Float](i))
+          case DoubleType => output.writeDouble(t.getAs[Double](i))
+          case _ => kryo.writeClassAndObject(output, t.get(i))
+        }
+      }
+
+
+
     }
 
 
@@ -42,19 +50,24 @@ class RowSerializer(val schema: StructType) extends Serializer[Row] {
     val cols = new Array[Any](size)
 
     for (fieldnum <- 0 until size) {
-
-      val fieldVal = dataTypes(fieldnum) match {
-        case StringType => input.readString()
-        case BooleanType => input.readBoolean()
-        case ByteType => input.readByte()
-        case ShortType => input.readShort()
-        case IntegerType => input.readInt()
-        case LongType => input.readLong()
-        case FloatType => input.readFloat()
-        case DoubleType => input.readDouble()
-        case _ => kryo.readClassAndObject(input)
+      var isNull: Byte = 0
+      if (nullableRows(fieldnum)) {
+        isNull = input.readByte()
       }
-
+      var fieldVal : Any = null
+      if( isNull == 0 ){
+        fieldVal = dataTypes(fieldnum) match {
+          case StringType => input.readString()
+          case BooleanType => input.readBoolean()
+          case ByteType => input.readByte()
+          case ShortType => input.readShort()
+          case IntegerType => input.readInt()
+          case LongType => input.readLong()
+          case FloatType => input.readFloat()
+          case DoubleType => input.readDouble()
+          case _ => kryo.readClassAndObject(input)
+        }
+      }
       cols(fieldnum) = fieldVal
     }
 
