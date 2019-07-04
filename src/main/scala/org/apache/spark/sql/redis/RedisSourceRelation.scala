@@ -6,7 +6,7 @@ import com.esotericsoftware.kryo.io.{Input, Output}
 import com.redislabs.provider.redis.rdd.Keys._
 import com.redislabs.provider.redis.util.ConnectionUtils.withConnection
 import com.redislabs.provider.redis.util.PipelineUtils._
-import com.redislabs.provider.redis.util.{KryoUtils, Logging, StopWatch, StopWatchAdv}
+import com.redislabs.provider.redis.util.{KryoUtils, Logging, StopWatch}
 import com.redislabs.provider.redis.{ReadWriteConfig, RedisConfig, RedisDataTypeHash, RedisDataTypeString, RedisEndpoint, RedisNode, toRedisContext}
 import org.apache.commons.lang3.SerializationUtils
 import org.apache.spark.TaskContext
@@ -55,6 +55,7 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
   }
 
   logInfo(s"Redis config initial host: ${redisConfig.initialHost}")
+  logInfo(s"Redis config maxPipelineSize: ${readWriteConfig.maxPipelineSize}")
 
   @transient private val sc = sqlContext.sparkContext
   /** parameters (sorted alphabetically) **/
@@ -144,9 +145,7 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
         case SqlOptionModelHash => writeRows(partition)
         case SqlOptionModelBinary => writeRows(partition)
         case SqlOptionModelBlock => {
-
           writeBlocks(partition, schema)
-
         }
       }
     }
@@ -163,7 +162,13 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
     kryo.register(GenericRowClass)
     val partId = TaskContext.getPartitionId()
 
-    partition.grouped(blockSize).foreach { rows =>
+    // assuming that the partition keys belong all to the same redis instance via :{partition_id}:
+    val blockKey = dataKey(tableName(), partId)
+    val conn = redisConfig.connectionForKey(blockKey)
+    var pipeline = conn.pipelined()
+    var pipePosition = 1
+    val table = tableName()
+    partition.grouped(blockSize).foreach { rows: Seq[Row] =>
       val stopWatch = new StopWatch()
       var marker = 0.0
       var output = new Output(kryoBufferSize)
@@ -180,19 +185,37 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
       output.close()
       if (logInfoVerbose) {
         logInfo(f"writeBlocks step(3/4) :: Time taken to serialize block with $blockSize rows (${serializedBlock.size} bytes) in partition $partId: ${stopWatch.getTimeSec()}%.3f sec")
+
         marker = stopWatch.getTimeSec()
       }
-      // TODO: pipeline?
-      val blockKey = dataKey(tableName())
-      val conn = redisConfig.connectionForKey(blockKey)
-      conn.set(blockKey.getBytes, serializedBlock)
-      conn.close()
+      pipeline.set(blockKey.getBytes, serializedBlock)
       if (logInfoVerbose) {
-        logInfo(f"writeBlocks step(4/4) :: Time taken to SET block with $blockSize rows in partition $partId: ${stopWatch.getTimeSec() - marker}%.3f sec")
+        logInfo(f"writeBlocks step(4/4) :: Time taken to PIPELINE.SET (pipeline size of $pipePosition) block with $blockSize rows in partition $partId: ${stopWatch.getTimeSec() - marker}%.3f sec")
+        marker = stopWatch.getTimeSec()
+      }
+
+      if (pipePosition % readWriteConfig.maxPipelineSize == 0) {
+        pipeline.sync()
+        pipeline = conn.pipelined()
+        logInfo(f"writeBlocks step(4.1/4) :: Time taken to SYNC PIPELINE with $pipePosition OPPS $partId: ${stopWatch.getTimeSec() - marker}%.3f sec")
+        pipePosition = 1
+        marker = stopWatch.getTimeSec()
+      }
+      pipePosition = pipePosition + 1
+
+      if (logInfoVerbose) {
         logInfo(f"writeBlocks allSteps :: All steps time with block with $blockSize rows in partition $partId: ${stopWatch.getTimeSec()}%.3f sec")
       }
     }
     KryoUtils.Pool.release(kryo)
+
+    // sync remaining items
+    if (pipePosition % readWriteConfig.maxPipelineSize != 0) {
+      pipeline.sync()
+      pipePosition = 1
+      logInfo(f"writeBlocks step(4.1/4) :: Final SYNC PIPELINE with $pipePosition OPPS in partition $partId")
+    }
+    conn.close()
 
     if (logInfoVerbose) {
       logInfo(f"writeBlocks ALL blocks: ${stopWatchWriteBlocks.getTimeSec()}%.3f sec")
@@ -200,12 +223,20 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
 
   }
 
+  /**
+    * @return table name
+    */
+  private def tableName(): String = {
+    tableNameOpt.getOrElse(throw new IllegalArgumentException(s"Option '$SqlOptionTableName' is not set."))
+  }
+
   private def writeRows(partition: Iterator[Row]): Unit = {
     // grouped iterator to only allocate memory for a portion of rows
+    val partId = TaskContext.getPartitionId()
     partition.grouped(iteratorGroupingSize).foreach { batch =>
       val stopWatch = new StopWatch()
       // the following can be optimized to not create a map
-      val rowsWithKey: Map[String, Row] = batch.map(row => dataKeyId(row) -> row).toMap
+      val rowsWithKey: Map[String, Row] = batch.map(row => dataKeyId(row, partId) -> row).toMap
       groupKeysByNode(redisConfig.hosts, rowsWithKey.keysIterator).foreach { case (node, keys) =>
         val conn = node.connect()
         foreachWithPipeline(conn, keys) { (pipeline, key) =>
@@ -216,7 +247,6 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
         conn.close()
       }
       if (logInfoVerbose) {
-        val partId = TaskContext.getPartitionId()
         logInfo(f"Time taken to write ${batch.size} rows in partition $partId: ${stopWatch.getTimeSec()}%.3f sec")
       }
     }
@@ -225,16 +255,9 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
   /**
     * @return redis key for the row
     */
-  private def dataKeyId(row: Row): String = {
+  private def dataKeyId(row: Row, partitionId: Integer): String = {
     val id = keyColumn.map(id => row.getAs[Any](id)).map(_.toString).getOrElse(uuid())
-    dataKey(tableName(), id)
-  }
-
-  /**
-    * @return table name
-    */
-  private def tableName(): String = {
-    tableNameOpt.getOrElse(throw new IllegalArgumentException(s"Option '$SqlOptionTableName' is not set."))
+    dataKey(tableName(), partitionId, id)
   }
 
   /**
@@ -425,42 +448,10 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
 
         logInfo(f"Time taken to deserialize all pipelined blocks: ${sw2.getTimeSec()}%.3f sec")
 
-        //        val sw1 = new StopWatch()
-        //        filteredKeys.foreach( key => {
-        //         val bytes: Array[Byte] = conn.get(key.getBytes)
-        ////          logInfo(f"Key ${key} has ${bytes.length} bytes")
-        //          if ( bytes.length > 0 ){
-        //            val input = new Input(bytes)
-        //            input.setPosition(0)
-        //            var numRows = input.readInt(true)
-        ////            logInfo(f"reading ${numRows} rows from redis key ${key} with available bytes ${input.available}")
-        //            for ( rowNumber <- 0 to numRows - 1){
-        //              val row = kryo.readObject(input, classOf[Row])
-        //              finalRowsList :+ row
-        //            }
-        //            input.close()
-        //          }
-        //
-        //        })
+
         KryoUtils.Pool.release(kryo)
         finalRowsList
       }
-
-
-      //
-      //
-      //        val res = pipelineValues.map { v =>
-      //          val serializedBlock = v.asInstanceOf[Array[Byte]]
-      //          v.asInstanceOf[Array[Byte]].map(bytes => {
-      //            val input = new Input(bytes)
-      //            project( kryo.readObject(input, classOf[Row] ), persistedSchema, requiredSchema )
-      //          })
-      //        }
-      //        logInfo(f"Time taken to deserialize blocks to objects (Kryo time): ${swKryo.getTimeSec()}%.3f sec")
-      //        logInfo(f"Time taken to deserialize and convert to Row: ${sw2.getTimeSec()}%.3f sec")
-      //        KryoUtils.Pool.release(kryo)
-      //        res
-      //      }
 
       persistenceModel match {
         case SqlOptionModelHash => readRows()
@@ -480,8 +471,8 @@ object RedisSourceRelation {
 
   def schemaKey(tableName: String): String = s"_spark:$tableName:schema"
 
-  def dataKey(tableName: String, id: String = uuid()): String = {
-    s"$tableName:$id"
+  def dataKey(tableName: String, partitionId: Integer, id: String = uuid()): String = {
+    s"$tableName:{$partitionId}:$id"
   }
 
   def uuid(): String = UUID.randomUUID().toString.replace("-", "")

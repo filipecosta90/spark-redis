@@ -4,6 +4,7 @@ import java.nio.charset.StandardCharsets.UTF_8
 
 import com.redislabs.provider.redis.df.BinaryDataframeSuite
 import com.redislabs.provider.redis.env.RedisClusterEnv
+import org.apache.spark.TaskContext
 import org.apache.spark.sql.redis.RedisSourceRelation.dataKey
 import redis.clients.jedis.{HostAndPort, JedisCluster}
 
@@ -16,7 +17,9 @@ class BinaryDataframeClusterSuite extends BinaryDataframeSuite with RedisCluster
     val host = redisConfig.initialHost
     val hostAndPort = new HostAndPort(host.host, host.port)
     val conn = new JedisCluster(hostAndPort)
-    conn.set(dataKey(tableName, key).getBytes(UTF_8), serialize(value))
+    val partId = TaskContext.getPartitionId()
+
+    conn.set(dataKey(tableName, partId, key).getBytes(UTF_8), serialize(value))
     conn.close()
   }
 }
