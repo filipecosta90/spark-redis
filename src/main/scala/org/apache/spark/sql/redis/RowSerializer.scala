@@ -5,14 +5,17 @@ import com.esotericsoftware.kryo.{Kryo, Serializer}
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.expressions.GenericRowWithSchema
 import org.apache.spark.sql.types._
+import org.slf4j.{Logger, LoggerFactory}
 
 class RowSerializer(val schema: StructType) extends Serializer[Row] {
 
-  val dataTypes: Array[DataType] = schema.fields.map(_.dataType)
-  val nullableRows: Array[Boolean] = schema.fields.map(_.nullable)
+  private val dataTypes: Array[DataType] = schema.fields.map(_.dataType)
+  private val nullableRows: Array[Boolean] = schema.fields.map(_.nullable)
+  private val LOG: Logger = LoggerFactory.getLogger(classOf[RowSerializer])
 
   // TODO: assess with Oleksiy (@fe2s) if the datatTypes are all covered
   override def write(kryo: Kryo, output: Output, t: Row): Unit = {
+
 
     // write the number of fields
     output.writeInt(t.length)
@@ -22,7 +25,7 @@ class RowSerializer(val schema: StructType) extends Serializer[Row] {
       if (nullableRows(i)) {
         output.writeByte(if (t.isNullAt(i)) 1 else 0)
       }
-      if (!t.isNullAt(i) ){
+      if (!t.isNullAt(i)) {
         dataTypes(i) match {
           case StringType => output.writeString(t.getAs[String](i))
           case BooleanType => output.writeBoolean(t.getAs[Boolean](i))
@@ -37,7 +40,6 @@ class RowSerializer(val schema: StructType) extends Serializer[Row] {
       }
 
 
-
     }
 
 
@@ -48,14 +50,15 @@ class RowSerializer(val schema: StructType) extends Serializer[Row] {
     // read the number of fields
     val size = input.readInt()
     val cols = new Array[Any](size)
+    //LOG.info(s"#COLS ${size}")
 
     for (fieldnum <- 0 until size) {
       var isNull: Byte = 0
       if (nullableRows(fieldnum)) {
         isNull = input.readByte()
       }
-      var fieldVal : Any = null
-      if( isNull == 0 ){
+      var fieldVal: Any = null
+      if (isNull == 0) {
         fieldVal = dataTypes(fieldnum) match {
           case StringType => input.readString()
           case BooleanType => input.readBoolean()

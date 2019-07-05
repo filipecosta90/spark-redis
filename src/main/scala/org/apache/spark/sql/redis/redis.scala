@@ -32,6 +32,6 @@ package object redis {
 
   val SqlOptionBlockSize = "model.block.size"
   val SqlOptionBlockSizeDefault = 1000
-  val SqlOptionRedisKryoSerializerBufferSizeMB = "kryoserializer.buffer.mb"
-  val SqlOptionRedisKryoSerializerBufferSizeMBDefault = 2
+  val SqlOptionRedisKryoSerializerBufferSizeKB = "kryoserializer.buffer.kb"
+  val SqlOptionRedisKryoSerializerBufferSizeKBDefault = 2
 }
