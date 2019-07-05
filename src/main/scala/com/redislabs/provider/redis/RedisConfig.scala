@@ -4,7 +4,7 @@ import java.net.URI
 
 import org.apache.spark.SparkConf
 import redis.clients.jedis.util.{JedisClusterCRC16, JedisURIHelper, SafeEncoder}
-import redis.clients.jedis.{Jedis, Protocol}
+import redis.clients.jedis.{Jedis, JedisPool, Protocol}
 
 import scala.collection.JavaConversions._
 
@@ -68,6 +68,10 @@ case class RedisEndpoint(host: String = Protocol.DEFAULT_HOST,
     ConnectionPool.connect(this)
   }
 
+  def pool(): JedisPool = {
+    ConnectionPool.getPool(this)
+  }
+
   /**
     * @return config with masked password. Used for logging.
     */
@@ -83,6 +87,9 @@ case class RedisNode(endpoint: RedisEndpoint,
                      total: Int) {
   def connect(): Jedis = {
     endpoint.connect()
+  }
+  def pool(): JedisPool = {
+    endpoint.pool()
   }
 }
 
@@ -171,6 +178,10 @@ class RedisConfig(val initialHost: RedisEndpoint) extends Serializable {
     */
   def connectionForKey(key: String): Jedis = {
     getHost(key).connect()
+  }
+
+  def poolForKey(key: String): JedisPool = {
+    getHost(key).pool()
   }
 
   /**

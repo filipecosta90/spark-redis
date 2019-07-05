@@ -31,6 +31,8 @@ package object redis {
   val SqlOptionIteratorGroupingSizeDefault = 1000
 
   val SqlOptionBlockSize = "model.block.size"
+  val ForkJoinPoolMaxThreads = "fork.joinPool.maxThreads"
+  val ForkJoinPoolMaxThreadsDefault = 6
   val SqlOptionBlockSizeDefault = 1000
   val SqlOptionRedisKryoSerializerBufferSizeKB = "kryoserializer.buffer.kb"
   val SqlOptionRedisKryoSerializerBufferSizeKBDefault = 2

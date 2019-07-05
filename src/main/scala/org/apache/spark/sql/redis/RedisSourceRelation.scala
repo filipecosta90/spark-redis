@@ -1,6 +1,7 @@
 package org.apache.spark.sql.redis
 
 import java.util.UUID
+import java.util.concurrent.ThreadPoolExecutor
 
 import com.esotericsoftware.kryo.io.{Input, Output}
 import com.redislabs.provider.redis.rdd.Keys._
@@ -16,10 +17,13 @@ import org.apache.spark.sql.redis.RedisSourceRelation._
 import org.apache.spark.sql.sources.{BaseRelation, Filter, InsertableRelation, PrunedFilteredScan}
 import org.apache.spark.sql.types.{StringType, StructField, StructType}
 import org.apache.spark.sql.{DataFrame, Row, SQLContext}
-import redis.clients.jedis.{PipelineBase, Protocol}
+import redis.clients.jedis.{Pipeline, PipelineBase, Protocol}
 
 import scala.collection.JavaConversions._
 import scala.collection.JavaConverters._
+import scala.collection.parallel.{ExecutionContextTaskSupport, ForkJoinTaskSupport, ParIterable}
+import scala.concurrent.ExecutionContext
+import scala.concurrent.forkjoin.ForkJoinPool
 
 class RedisSourceRelation(override val sqlContext: SQLContext,
                           parameters: Map[String, String],
@@ -124,7 +128,6 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
 
   override def insert(data: DataFrame, overwrite: Boolean): Unit = {
     val stopWatch = new StopWatch()
-
     val schema = userSpecifiedSchema.getOrElse(data.schema)
     // write schema, so that we can load dataframe back
     currentSchema = saveSchema(schema)
@@ -148,7 +151,7 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
         case SqlOptionModelHash => writeRows(partition)
         case SqlOptionModelBinary => writeRows(partition)
         case SqlOptionModelBlock => {
-          writeBlocks(partition, schema)
+          writeBlocks(partition, schema, forkJoinPool)
         }
       }
     }
@@ -168,85 +171,120 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
 
     val table = tableName()
     var currentRedisKey = dataKey(table, partId)
+    val currentRedisKeyBytes: Array[Byte] = currentRedisKey.getBytes
 
     // assuming that the partition keys belong all to the same redis instance via :{partition_id}:
-    val conn = redisConfig.connectionForKey(currentRedisKey)
-    val buffer: Array[Byte] = new Array[Byte](kryoBufferSize)
+    val pool = redisConfig.poolForKey(currentRedisKey)
+    val pipeline = pool.getResource.pipelined()
+  //  val buffer: Array[Byte] = new Array[Byte](kryoBufferSize)
 
-    var pipeline = conn.pipelined()
-    var pipePosition : Integer = 0
-    var output = new Output(buffer)
-
-    var numberRowsInBlock  : Integer = 0
-    var blockNum  : Integer = 0
-
-    logInfo(f"Partion ID: ${partId} Using output buffer length of ${buffer.length} Bytes")
+   // logInfo(f"Partion ID: ${partId} Using output buffer length of ${buffer.length} Bytes")
 
     val stopWatch = new StopWatch()
 
-    for (row <- partition) {
-      numberRowsInBlock = numberRowsInBlock + 1
+    // Scala parallel collections are not lazy! when you construct par-iterator it actually brings all rows from Iterator[Row] into memory.
+    val parallelPartitionIterator: ParIterable[Row] = partition.toIterable.par
 
-      // runs once per block ( at the beginning )
-      //if first row in block
-      //save the number of row in that block
-      if (numberRowsInBlock == 1) {
-        output.setPosition(0)
-        output.writeInt(1)
-        pipeline.append(currentRedisKey.getBytes, buffer.slice(0, output.position()))
-      }
+    val maxThreads = 12
 
-      output.setPosition(0)
-      rowSerializer.write(kryo, output, row)
-      pipeline.append(currentRedisKey.getBytes, buffer.slice(0, output.position()))
-      pipePosition = pipePosition + 1
+    val threadPipelines = new Array[Pipeline](maxThreads)
+    val threadBuffers = new Array[Array[Byte]](maxThreads)
+    val threadOutputs = new Array[Output](maxThreads)
 
-
-      // runs once per block ( at the end )
-      if (numberRowsInBlock == blockSize) {
-        //now that we got to the block limit lets save its correct size
-        output.setPosition(0)
-        output.writeInt(numberRowsInBlock)
-        pipeline.setrange(currentRedisKey.getBytes, 0, buffer.slice(0, output.position()))
-        //swap to block and redis new key
-        blockNum += 1
-        numberRowsInBlock = 0
-        currentRedisKey = dataKey(table, partId)
-        if (logInfoVerbose) {
-          logInfo(f"setting up a new block. New redis key: ${currentRedisKey}")
-        }
-      }
-
-      if (pipePosition >= readWriteConfig.maxPipelineSize) {
-        val redisStopWatch = new StopWatch()
-        pipeline.sync()
-        if (logInfoVerbose) {
-          logInfo(f"writeBlocks step(3/3) :: Time taken to PIPELINE.APPEND (pipeline size of $pipePosition) block with $blockSize rows in partition $partId: ${redisStopWatch.getTimeSec()}%.3f sec")
-        }
-        pipeline = conn.pipelined()
-        pipePosition = 0
-      }
-
+    for (i <- 0 until maxThreads) {
+      threadPipelines(i) = redisConfig.poolForKey(currentRedisKey).getResource.pipelined()
+      threadBuffers(i) = new Array[Byte](kryoBufferSize)
+      threadOutputs(i) = new Output(threadBuffers(i))
     }
-    if (logInfoVerbose) {
-      logInfo(f"writeBlocks allSteps :: All steps time with block with $blockSize rows in partition $partId: ${stopWatch.getTimeSec()}%.3f sec")
+    parallelPartitionIterator.tasksupport =  new ForkJoinTaskSupport(new ForkJoinPool(maxThreads))
+
+
+    parallelPartitionIterator.foreach(row => {
+        val threadId: Integer =Thread.currentThread().getId().toInt%maxThreads
+     //   threadOutputs(threadId).setPosition(0)
+        rowSerializer.write(kryo, threadOutputs(threadId), row)
+        //pipePosition = pipePosition + 1
+        // do something
+      })
+
+    for (i <- 0 until maxThreads) {
+      threadPipelines(i).append(currentRedisKeyBytes, threadBuffers(i).slice(0, threadOutputs(i).position()))
     }
 
-    //save the size of last block if it has more than one row
-    if (numberRowsInBlock > 1) {
-      output.setPosition(0)
-      output.writeInt(numberRowsInBlock)
-      pipeline.setrange(currentRedisKey.getBytes, 0, buffer.slice(0, output.position()))
-    }
+
+
+
+pool.close()
+
+   // pipeline.append(currentRedisKeyBytes, buffer.slice(0, output.position()))
+
+//
+//
+//    for (row <- partition) {
+//      numberRowsInBlock = numberRowsInBlock + 1
+//
+//      // runs once per block ( at the beginning )
+//      //if first row in block
+//      //save the number of row in that block
+//      if (numberRowsInBlock == 1) {
+//        output.setPosition(0)
+//        output.writeInt(1)
+//        pipeline.append(currentRedisKey.getBytes, buffer.slice(0, output.position()))
+//      }
+//
+//      output.setPosition(0)
+//      rowSerializer.write(kryo, output, row)
+//      pipeline.append(currentRedisKey.getBytes, buffer.slice(0, output.position()))
+//      pipePosition = pipePosition + 1
+//
+//
+//      // runs once per block ( at the end )
+//      if (numberRowsInBlock == blockSize) {
+//        //now that we got to the block limit lets save its correct size
+//        output.setPosition(0)
+//        output.writeInt(numberRowsInBlock)
+//        pipeline.setrange(currentRedisKey.getBytes, 0, buffer.slice(0, output.position()))
+//        //swap to block and redis new key
+//        blockNum += 1
+//        numberRowsInBlock = 0
+//        currentRedisKey = dataKey(table, partId)
+//        if (logInfoVerbose) {
+//          logInfo(f"setting up a new block. New redis key: ${currentRedisKey}")
+//        }
+//      }
+//
+//      if (pipePosition >= readWriteConfig.maxPipelineSize) {
+//        val redisStopWatch = new StopWatch()
+//        pipeline.sync()
+//        if (logInfoVerbose) {
+//          logInfo(f"writeBlocks step(3/3) :: Time taken to PIPELINE.APPEND (pipeline size of $pipePosition) block with $blockSize rows in partition $partId: ${redisStopWatch.getTimeSec()}%.3f sec")
+//        }
+//        pipeline = conn.pipelined()
+//        pipePosition = 0
+//      }
+//
+//    }
+//    if (logInfoVerbose) {
+//      logInfo(f"writeBlocks allSteps :: All steps time with block with $blockSize rows in partition $partId: ${stopWatch.getTimeSec()}%.3f sec")
+//    }
+//
+//    //save the size of last block if it has more than one row
+//    if (numberRowsInBlock > 1) {
+//      output.setPosition(0)
+//      output.writeInt(numberRowsInBlock)
+//      pipeline.setrange(currentRedisKey.getBytes, 0, buffer.slice(0, output.position()))
+//    }
     KryoUtils.Pool.release(kryo)
 
     // sync remaining items
-    if (pipePosition % readWriteConfig.maxPipelineSize != 0) {
-      pipeline.sync()
-      pipePosition = 1
-      logInfo(f"writeBlocks step(4.1/4) :: Final SYNC PIPELINE with $pipePosition OPPS in partition $partId")
-    }
-    conn.close()
+   // pipeline.sync()
+//
+//    if (pipePosition % readWriteConfig.maxPipelineSize != 0) {
+//      pipeline.sync()
+//      pipePosition = 1
+//      logInfo(f"writeBlocks step(4.1/4) :: Final SYNC PIPELINE with $pipePosition OPPS in partition $partId")
+//    }
+   // conn.close()
 
     if (logInfoVerbose) {
       logInfo(f"writeBlocks ALL blocks: ${stopWatchWriteBlocks.getTimeSec()}%.3f sec")
