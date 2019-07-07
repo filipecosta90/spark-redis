@@ -16,16 +16,11 @@ class RowSerializer(val schema: StructType) extends Serializer[Row] {
   // TODO: assess with Oleksiy (@fe2s) if the datatTypes are all covered
   override def write(kryo: Kryo, output: Output, t: Row): Unit = {
 
-
     // write the number of fields
     output.writeInt(t.length)
 
     for (i <- 0 until t.length) {
-      //if the column is allowed to be null
-      if (nullableRows(i)) {
-        output.writeByte(if (t.isNullAt(i)) 1 else 0)
-      }
-      if (!t.isNullAt(i)) {
+      def writeValue(): Unit = {
         dataTypes(i) match {
           case StringType => output.writeString(t.getAs[String](i))
           case BooleanType => output.writeBoolean(t.getAs[Boolean](i))
@@ -35,11 +30,17 @@ class RowSerializer(val schema: StructType) extends Serializer[Row] {
           case LongType => output.writeLong(t.getAs[Long](i))
           case FloatType => output.writeFloat(t.getAs[Float](i))
           case DoubleType => output.writeDouble(t.getAs[Double](i))
-          case _ => kryo.writeClassAndObject(output, t.get(i))
+          case _ => if (!t.isNullAt(i)) {kryo.writeClassAndObject(output, t.get(i))}
         }
       }
 
-
+      //if the column is allowed to be null
+      if (nullableRows(i)) {
+        output.writeByte(if (t.isNullAt(i)) 1 else 0 )
+      }
+      if( !t.isNullAt(i) ){
+        writeValue()
+      }
     }
 
 
@@ -50,15 +51,16 @@ class RowSerializer(val schema: StructType) extends Serializer[Row] {
     // read the number of fields
     val size = input.readInt()
     val cols = new Array[Any](size)
-    //LOG.info(s"#COLS ${size}")
 
     for (fieldnum <- 0 until size) {
       var isNull: Byte = 0
-      if (nullableRows(fieldnum)) {
-        isNull = input.readByte()
+      if ( fieldnum < nullableRows.length ){
+        if (nullableRows(fieldnum)) {
+          isNull = input.readByte()
+        }
       }
       var fieldVal: Any = null
-      if (isNull == 0) {
+      if( isNull == 0 ){
         fieldVal = dataTypes(fieldnum) match {
           case StringType => input.readString()
           case BooleanType => input.readBoolean()
@@ -71,7 +73,9 @@ class RowSerializer(val schema: StructType) extends Serializer[Row] {
           case _ => kryo.readClassAndObject(input)
         }
       }
+
       cols(fieldnum) = fieldVal
+
     }
 
     new GenericRowWithSchema(cols, schema)
