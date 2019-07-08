@@ -10,6 +10,7 @@ import org.slf4j.{Logger, LoggerFactory}
 class RowSerializer(val schema: StructType) extends Serializer[Row] {
 
   private val dataTypes: Array[DataType] = schema.fields.map(_.dataType)
+  private val nCols: Integer = schema.fields.size
   private val nullableRows: Array[Boolean] = schema.fields.map(_.nullable)
   private val LOG: Logger = LoggerFactory.getLogger(classOf[RowSerializer])
 
@@ -17,9 +18,8 @@ class RowSerializer(val schema: StructType) extends Serializer[Row] {
   override def write(kryo: Kryo, output: Output, t: Row): Unit = {
 
     // write the number of fields
-    output.writeInt(t.length)
 
-    for (i <- 0 until t.length) {
+    for (i <- 0 until nCols) {
       def writeValue(): Unit = {
         dataTypes(i) match {
           case StringType => output.writeString(t.getAs[String](i))
@@ -30,15 +30,15 @@ class RowSerializer(val schema: StructType) extends Serializer[Row] {
           case LongType => output.writeLong(t.getAs[Long](i))
           case FloatType => output.writeFloat(t.getAs[Float](i))
           case DoubleType => output.writeDouble(t.getAs[Double](i))
-          case _ => if (!t.isNullAt(i)) {kryo.writeClassAndObject(output, t.get(i))}
+          case _ => kryo.writeClassAndObject(output, t.get(i))
         }
       }
 
       //if the column is allowed to be null
       if (nullableRows(i)) {
-        output.writeByte(if (t.isNullAt(i)) 1 else 0 )
+        output.writeByte(if (t.isNullAt(i)) 1 else 0)
       }
-      if( !t.isNullAt(i) ){
+      if (!t.isNullAt(i)) {
         writeValue()
       }
     }
@@ -48,19 +48,16 @@ class RowSerializer(val schema: StructType) extends Serializer[Row] {
 
   override def read(kryo: Kryo, input: Input, aClass: Class[Row]): Row = {
 
-    // read the number of fields
-    val size = input.readInt()
-    val cols = new Array[Any](size)
+    val cols = new Array[Any](nCols)
 
-    for (fieldnum <- 0 until size) {
+    for (fieldnum <- 0 until nCols) {
       var isNull: Byte = 0
-      if ( fieldnum < nullableRows.length ){
-        if (nullableRows(fieldnum)) {
-          isNull = input.readByte()
-        }
+      if (nullableRows(fieldnum)) {
+        isNull = input.readByte()
       }
+
       var fieldVal: Any = null
-      if( isNull == 0 ){
+      if (isNull == 0) {
         fieldVal = dataTypes(fieldnum) match {
           case StringType => input.readString()
           case BooleanType => input.readBoolean()
@@ -73,9 +70,7 @@ class RowSerializer(val schema: StructType) extends Serializer[Row] {
           case _ => kryo.readClassAndObject(input)
         }
       }
-
       cols(fieldnum) = fieldVal
-
     }
 
     new GenericRowWithSchema(cols, schema)

@@ -1,7 +1,9 @@
 package org.apache.spark.sql.redis
 
 import java.util.UUID
+import java.util.concurrent.{ExecutorService, Executors}
 
+import com.esotericsoftware.kryo.Kryo
 import com.esotericsoftware.kryo.io.{Input, Output}
 import com.redislabs.provider.redis.rdd.Keys._
 import com.redislabs.provider.redis.util.ConnectionUtils.withConnection
@@ -16,10 +18,65 @@ import org.apache.spark.sql.redis.RedisSourceRelation._
 import org.apache.spark.sql.sources.{BaseRelation, Filter, InsertableRelation, PrunedFilteredScan}
 import org.apache.spark.sql.types.{StringType, StructField, StructType}
 import org.apache.spark.sql.{DataFrame, Row, SQLContext}
-import redis.clients.jedis.{PipelineBase, Protocol}
+import redis.clients.jedis.{Pipeline, PipelineBase, Protocol}
 
 import scala.collection.JavaConversions._
 import scala.collection.JavaConverters._
+import scala.concurrent.{ExecutionContext, Future}
+
+
+/** A singleton object that controls the parallelism on a Single Executor JVM
+  */
+object ThreadedConcurrentContext {
+
+  import scala.concurrent._
+  import scala.concurrent.duration.Duration
+  import scala.concurrent.duration.Duration._
+
+  /** Wraps a code block in a Future and returns the future */
+  def executeAsync[T](f: => T)(implicit ec: ExecutionContext): Future[T] = {
+    Future(f)(ec)
+  }
+
+  /** Awaits an entire sequence of futures and returns an iterator. This will
+    * wait for all futures to complete before returning **/
+  def awaitAll[T](it: Iterator[Future[T]], timeout: Duration = Inf)(implicit ec: ExecutionContext): Iterator[T] = {
+    Await.result(Future.sequence(it), timeout)
+  }
+
+  /** Awaits only a set of elements at a time. Instead of waiting for the entire batch
+    * to finish waits only for the head element before requesting the next future */
+  def awaitSliding[T](it: Iterator[Future[T]], batchSize: Int = 3, timeout: Duration = Inf)(implicit ec: ExecutionContext): Iterator[T] = {
+    val slidingIterator = it.sliding(batchSize - 1).withPartial(true) //Our look ahead (hasNext) will auto start the nth future in the batch
+    val (initIterator, tailIterator) = slidingIterator.span(_ => slidingIterator.hasNext)
+    initIterator.map(futureBatch => Await.result(futureBatch.head, timeout)) ++
+      tailIterator.flatMap(lastBatch => Await.result(Future.sequence(lastBatch), timeout))
+  }
+}
+
+
+class RowHandler(threadPoolSize: Int, serializerArray: Array[RowSerializer], kryoArray: Array[Kryo], outputArray: Array[Output], bufferArray: Array[Array[Byte]], pipelineArray: Array[Pipeline], row: Row, redisKey: Array[Byte]) extends Runnable {
+
+  val threadId: Int = Thread.currentThread().getId.toInt % threadPoolSize
+
+  val output: Output = outputArray(threadId)
+
+  //val pipeline: Pipeline = pipelineArray(threadId)
+
+  val kryo: Kryo = kryoArray(threadId)
+
+  val buffer: Array[Byte] = bufferArray(threadId)
+
+
+  val rowSerializer = serializerArray(threadId)
+
+  def run() {
+    output.setPosition(0)
+    rowSerializer.write(kryo, output, row)
+    val bytes = buffer.slice(0, output.position())
+    //    pipeline.set(redisKey, buffer.slice(0, output.position()))
+  }
+}
 
 class RedisSourceRelation(override val sqlContext: SQLContext,
                           parameters: Map[String, String],
@@ -29,6 +86,7 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
     with PrunedFilteredScan
     with Serializable
     with Logging {
+
 
   private implicit val redisConfig: RedisConfig = {
     new RedisConfig(
@@ -74,6 +132,7 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
   private val logInfoVerbose = parameters.get(SqlOptionLogInfoVerbose).exists(_.toBoolean)
   private val blockSize = parameters.get(SqlOptionBlockSize).map(_.toInt).getOrElse(SqlOptionBlockSizeDefault)
   private val kryoBufferSize = parameters.get(SqlOptionRedisKryoSerializerBufferSizeKB).map(_.toInt).getOrElse(SqlOptionRedisKryoSerializerBufferSizeKBDefault) * 1024
+  private val rowThreadPoolSize = parameters.get(SqlOptionRowThreadPoolSize).map(_.toInt).getOrElse(SqlOptionRowThreadPoolSizeDefault)
 
 
   /**
@@ -90,6 +149,7 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
   logInfo(f"Redis persistence model: ${persistenceModel}")
   logInfo(s"Redis config maxPipelineSize: ${readWriteConfig.maxPipelineSize}")
   logInfo(f"Redis kryoBufferSize of: ${kryoBufferSize} bytes")
+  logInfo(f"Redis rowThreadPoolSize of: ${rowThreadPoolSize} threads")
 
 
   /**
@@ -141,183 +201,78 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
       }
       logInfo(f"Time taken to delete dataframe (SaveMode.Overwrite): ${stopWatch.getTimeSec()}%.3f sec")
     }
-
-    // write data
     data.foreachPartition { partition =>
-      persistenceModel match {
-        case SqlOptionModelHash => writeRows(partition)
-        case SqlOptionModelBinary => writeRows(partition)
-        case SqlOptionModelBlock => {
-          writeBlocks(partition, schema)
-        }
+    persistenceModel match {
+      case SqlOptionModelHash => writeRows(partition)
+      case SqlOptionModelBinary => writeRows(partition)
+      case SqlOptionModelBlock => {
+          implicit val ec = ExecutionContext.fromExecutor(Executors.newFixedThreadPool(rowThreadPoolSize))
+
+          val partId = TaskContext.getPartitionId()
+          val table = tableName()
+          // assuming that the partition keys belong all to the same redis instance via :{partition_id}:
+          val conn = redisConfig.connectionForKey(dataKey(table, partId))
+          val pipeline = conn.pipelined()
+
+          val bufferArray: Array[Array[Byte]] = new Array[Array[Byte]](rowThreadPoolSize)
+          val outputArray: Array[Output] = new Array[Output](rowThreadPoolSize)
+          val pipelineArray: Array[Pipeline] = new Array[Pipeline](rowThreadPoolSize)
+          val pipelinePos: Array[Integer] = new Array[Integer](rowThreadPoolSize)
+          val kryoArray: Array[Kryo] = new Array[Kryo](rowThreadPoolSize)
+          val serializerArray: Array[RowSerializer] = new Array[RowSerializer](rowThreadPoolSize)
+
+          for (threadNum <- 0 until rowThreadPoolSize){
+            bufferArray(threadNum) = new Array[Byte](kryoBufferSize)
+            outputArray(threadNum) = new Output(bufferArray(threadNum))
+            val kryo = KryoUtils.Pool.borrow()
+            val rowSerializer = new RowSerializer(schema)
+            serializerArray(threadNum) = rowSerializer
+            kryo.addDefaultSerializer(RowClass, rowSerializer)
+            kryo.register(RowClass)
+            kryo.register(GenericRowClass)
+            kryoArray(threadNum) = kryo
+            pipelineArray(threadNum) = conn.pipelined()
+            pipelinePos(threadNum) = 0
+          }
+
+          val resultSet: Iterator[Future[Array[Byte]]] = partition.map(row => {
+            val threadId: Int = Thread.currentThread().getId.toInt % rowThreadPoolSize
+
+            val result = ThreadedConcurrentContext.executeAsync(workerSerializer(serializerArray(threadId), outputArray(threadId), kryoArray(threadId), bufferArray(threadId), row))
+            result
+          })
+
+          ThreadedConcurrentContext.awaitSliding(resultSet).foreach(valueBytes => {
+            val threadId: Int = Thread.currentThread().getId.toInt % rowThreadPoolSize
+            pipelinePos(threadId) =  pipelinePos(threadId) + 1
+            ThreadedConcurrentContext.executeAsync(workerRedis(pipeline, dataKey(table, partId).getBytes(), valueBytes,  pipelinePos(threadId), readWriteConfig.maxPipelineSize ))
+          } )
+
+          for (threadNum <- 0 until rowThreadPoolSize) {
+            KryoUtils.Pool.release(kryoArray(threadNum))
+          }
+          conn.close()
+        logInfo(f"Time taken to insert data: ${stopWatch.getTimeSec()}%.3f sec")
+
+      }
+
       }
     }
 
-    logInfo(f"Time taken to insert data: ${stopWatch.getTimeSec()}%.3f sec")
 
   }
 
-  private def writeBlocks(partition: Iterator[Row], schema: StructType): Unit = {
-    val stopWatchWriteBlocks = new StopWatch()
-    val kryo = KryoUtils.Pool.borrow()
-    val rowSerializer = new RowSerializer(schema)
-    kryo.addDefaultSerializer(RowClass, rowSerializer)
-    kryo.register(RowClass)
-    kryo.register(GenericRowClass)
-    val partId = TaskContext.getPartitionId()
+  private def workerSerializer(rowSerializer: RowSerializer, output: Output, kryo: Kryo, buffer: Array[Byte], row: Row): Array[Byte] = {
+    output.setPosition(0)
+    rowSerializer.write(kryo, output, row)
+    buffer.slice(0, output.position())
+  }
 
-    val table = tableName()
-    var currentRedisKey = dataKey(table, partId)
-
-    // assuming that the partition keys belong all to the same redis instance via :{partition_id}:
-    val conn = redisConfig.connectionForKey(currentRedisKey)
-    val buffer: Array[Byte] = new Array[Byte](kryoBufferSize)
-
-    var pipeline = conn.pipelined()
-    var pipePosition : Integer = 0
-    var output = new Output(buffer)
-
-    var numberRowsInBlock  : Integer = 0
-    var blockNum  : Integer = 0
-    var timeBlockStart: Long = 0
-    var timeBlockEnd: Long = 0
-    var timeRowSerialize: Long = 0
-    var timeRowPipeline : Long= 0
-    var timeRowPipelineSync: Long = 0
-
-    logInfo(f"writeBlocks setup time forPartion ID: ${partId}  ${stopWatchWriteBlocks.getTimeSec()}%.3f sec")
-    logInfo(f"Partion ID: ${partId} Using output buffer length of ${buffer.length} Bytes")
-
-    val stopWatch = new StopWatch()
-    var marker: Long  = stopWatch.getTime()
-
-    for (row <- partition) {
-      marker = stopWatch.getTime()
-      numberRowsInBlock = numberRowsInBlock + 1
-
-      // runs once per block ( at the beginning )
-      //if first row in block
-      //save the number of rows in that block
-      if (numberRowsInBlock == 1) {
-        output.setPosition(0)
-        output.writeInt(1)
-        pipeline.append(currentRedisKey.getBytes, buffer.slice(0, output.position()))
-        timeBlockStart = timeBlockStart + (stopWatch.getTime()-marker)
-        marker=stopWatch.getTime()
-
-      }
-      output.setPosition(0)
-      rowSerializer.write(kryo, output, row)
-      // ROW Serializer 1.1
-      timeRowSerialize = timeRowSerialize + (stopWatch.getTime()-marker)
-      marker=stopWatch.getTime()
-
-      pipeline.append(currentRedisKey.getBytes, buffer.slice(0, output.position()))
-      pipePosition = pipePosition + 1
-      // ROW REDIS PIPELINE.APPEND 1.2
-      timeRowPipeline = timeRowPipeline + (stopWatch.getTime()-marker)
-      marker=stopWatch.getTime()
-
-
-
-
-      // runs once per block ( at the end )
-      if (numberRowsInBlock == blockSize) {
-        //now that we got to the block limit lets save its correct size
-        output.setPosition(0)
-        output.writeInt(numberRowsInBlock)
-        pipeline.setrange(currentRedisKey.getBytes, 0, buffer.slice(0, output.position()))
-        //swap to block and redis new key
-        blockNum += 1
-        numberRowsInBlock = 0
-        currentRedisKey = dataKey(table, partId)
-        // BLOCK END 2.0
-        timeBlockEnd = timeBlockEnd + (stopWatch.getTime()-marker)
-        marker=stopWatch.getTime()
-
-      }
-
-      if (pipePosition >= readWriteConfig.maxPipelineSize) {
-        pipeline.sync()
-        pipeline = conn.pipelined()
-        pipePosition = 0
-        // ROW REDIS PIPELINE.SYNC 1.3
-        timeRowPipelineSync = timeRowPipelineSync + (stopWatch.getTime()-marker)
-        marker=stopWatch.getTime()
-      }
-
-    }
-
-
-    //save the size of last block if it has more than one row
-    if (numberRowsInBlock > 1) {
-      output.setPosition(0)
-      output.writeInt(numberRowsInBlock)
-      pipeline.setrange(currentRedisKey.getBytes, 0, buffer.slice(0, output.position()))
-    }
-    KryoUtils.Pool.release(kryo)
-
-    // sync remaining items
-    if (pipePosition % readWriteConfig.maxPipelineSize != 0) {
-      marker = stopWatch.getTime()
+  private def workerRedis(pipeline: Pipeline, keyArray: Array[Byte], valueArray: Array[Byte], pipelinePos : Int, pipelineMax : Int): Unit = {
+    pipeline.set(keyArray, valueArray)
+    if (pipelinePos >= pipelineMax){
       pipeline.sync()
-      pipePosition = 1
-      logInfo(f"writeBlocks REDIS PIPELINE.SYNC FINAL :: Final SYNC PIELINE with $pipePosition OPPS in partition $partId: ${stopWatch.getTimeSec()-marker}%.3f sec")
     }
-
-
-
-    if (logInfoVerbose) {
-      logInfo(f"BLOCK START 0.1 ${timeBlockStart} msec")
-      logInfo(f"ROW REDIS SERIALIZE 1.1 ${timeRowSerialize} msec")
-      logInfo(f"ROW REDIS PIPELINE.APPEND 1.1 ${timeRowPipeline} msec")
-      logInfo(f"BLOCK END 2.0 ${timeBlockEnd} msec")
-      logInfo(f"ROW REDIS PIPELINE.SYNC 1.3 ${timeRowPipelineSync} msec")
-    }
-
-    conn.close()
-
-    if (logInfoVerbose) {
-      logInfo(f"writeBlocks ALL blocks: ${stopWatchWriteBlocks.getTimeSec()}%.3f sec")
-    }
-
-  }
-
-  private def writeRows(partition: Iterator[Row]): Unit = {
-    // grouped iterator to only allocate memory for a portion of rows
-    val partId = TaskContext.getPartitionId()
-    partition.grouped(iteratorGroupingSize).foreach { batch =>
-      val stopWatch = new StopWatch()
-      // the following can be optimized to not create a map
-      val rowsWithKey: Map[String, Row] = batch.map(row => dataKeyId(row, partId) -> row).toMap
-      groupKeysByNode(redisConfig.hosts, rowsWithKey.keysIterator).foreach { case (node, keys) =>
-        val conn = node.connect()
-        foreachWithPipeline(conn, keys) { (pipeline, key) =>
-          val row = rowsWithKey(key)
-          val encodedRow = persistence.encodeRow(keyName, row)
-          persistence.save(pipeline, key, encodedRow, ttl)
-        }
-        conn.close()
-      }
-      if (logInfoVerbose) {
-        logInfo(f"Time taken to write ${batch.size} rows in partition $partId: ${stopWatch.getTimeSec()}%.3f sec")
-      }
-    }
-  }
-
-  /**
-    * @return redis key for the row
-    */
-  private def dataKeyId(row: Row, partitionId: Integer): String = {
-    val id = keyColumn.map(id => row.getAs[Any](id)).map(_.toString).getOrElse(uuid())
-    dataKey(tableName(), partitionId, id)
-  }
-
-  /**
-    * @return table name
-    */
-  private def tableName(): String = {
-    tableNameOpt.getOrElse(throw new IllegalArgumentException(s"Option '$SqlOptionTableName' is not set."))
   }
 
   /**
@@ -380,11 +335,11 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
           }
           marker = stopWatch.getTimeSec()
           val rows = group.flatMap { case (node, keys) =>
-              scanRows(node, keys, keyType, requiredSchema, requiredColumns)
-            }
+            scanRows(node, keys, keyType, requiredSchema, requiredColumns)
+          }
           if (logInfoVerbose) {
             val partId = TaskContext.getPartitionId()
-            logInfo(f"Time taken to read ${batch.size} values/blocks in partition $partId: ${stopWatch.getTimeSec()-marker}%.3f sec")
+            logInfo(f"Time taken to read ${batch.size} values/blocks in partition $partId: ${stopWatch.getTimeSec() - marker}%.3f sec")
           }
           rows
         }
@@ -415,6 +370,102 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
     val isEmpty = sc.fromRedisKeyPattern(dataKeyPattern, partitionNum = numPartitions).isEmpty()
     logInfo(f"Time taken to check if keys exist for pattern $dataKeyPattern: ${stopWatch.getTimeSec()}%.3f sec")
     isEmpty
+  }
+
+  private def writeBlocks(rowThreadPool: ExecutorService, partition: Iterator[Row], schema: StructType): Unit = {
+    val stopWatchWriteBlocks = new StopWatch()
+
+    val partId = TaskContext.getPartitionId()
+
+    val table = tableName()
+    var currentRedisKey = dataKey(table, partId)
+
+    // assuming that the partition keys belong all to the same redis instance via :{partition_id}:
+    val conn = redisConfig.connectionForKey(currentRedisKey)
+
+    val bufferArray: Array[Array[Byte]] = new Array[Array[Byte]](rowThreadPoolSize)
+    val outputArray: Array[Output] = new Array[Output](rowThreadPoolSize)
+    val pipelineArray: Array[Pipeline] = new Array[Pipeline](rowThreadPoolSize)
+    val pipelinePos: Array[Integer] = new Array[Integer](rowThreadPoolSize)
+    val kryoArray: Array[Kryo] = new Array[Kryo](rowThreadPoolSize)
+    val serializerArray: Array[RowSerializer] = new Array[RowSerializer](rowThreadPoolSize)
+
+    for (threadNum <- 0 until rowThreadPoolSize) {
+      bufferArray(threadNum) = new Array[Byte](kryoBufferSize)
+      outputArray(threadNum) = new Output(bufferArray(threadNum))
+      pipelineArray(threadNum) = conn.pipelined()
+      val kryo = KryoUtils.Pool.borrow()
+      val rowSerializer = new RowSerializer(schema)
+      serializerArray(threadNum) = rowSerializer
+      kryo.addDefaultSerializer(RowClass, rowSerializer)
+      kryo.register(RowClass)
+      kryo.register(GenericRowClass)
+      kryoArray(threadNum) = kryo
+      pipelinePos(threadNum) = 0
+    }
+
+    logInfo(f"writeBlocks setup time forPartion ID: ${partId}  ${stopWatchWriteBlocks.getTime()} msec")
+    //    logInfo(f"Partion ID: ${partId} Using output buffer length of ${buffer.length} Bytes")
+
+    var marker: Long = stopWatchWriteBlocks.getTime()
+
+    for (row <- partition) {
+      rowThreadPool.execute(new RowHandler(rowThreadPoolSize, serializerArray, kryoArray, outputArray, bufferArray, pipelineArray, row, dataKey(table, partId).getBytes))
+    }
+
+    logInfo(f"writeBlocks threadPool timeforPartion ID: ${partId}  ${stopWatchWriteBlocks.getTime() - marker} msec")
+
+    for (threadNum <- 0 until rowThreadPoolSize) {
+      pipelineArray(threadNum).sync()
+    }
+
+    for (threadNum <- 0 until rowThreadPoolSize) {
+      KryoUtils.Pool.release(kryoArray(threadNum))
+    }
+
+    conn.close()
+
+    if (logInfoVerbose) {
+      logInfo(f"writeBlocks ALL blocks: ${stopWatchWriteBlocks.getTime()}%.3f sec")
+    }
+
+  }
+
+  private def writeRows(partition: Iterator[Row]): Unit = {
+    // grouped iterator to only allocate memory for a portion of rows
+    val partId = TaskContext.getPartitionId()
+    partition.grouped(iteratorGroupingSize).foreach { batch =>
+      val stopWatch = new StopWatch()
+      // the following can be optimized to not create a map
+      val rowsWithKey: Map[String, Row] = batch.map(row => dataKeyId(row, partId) -> row).toMap
+      groupKeysByNode(redisConfig.hosts, rowsWithKey.keysIterator).foreach { case (node, keys) =>
+        val conn = node.connect()
+        foreachWithPipeline(conn, keys) { (pipeline, key) =>
+          val row = rowsWithKey(key)
+          val encodedRow = persistence.encodeRow(keyName, row)
+          persistence.save(pipeline, key, encodedRow, ttl)
+        }
+        conn.close()
+      }
+      if (logInfoVerbose) {
+        logInfo(f"Time taken to write ${batch.size} rows in partition $partId: ${stopWatch.getTimeSec()}%.3f sec")
+      }
+    }
+  }
+
+  /**
+    * @return redis key for the row
+    */
+  private def dataKeyId(row: Row, partitionId: Integer): String = {
+    val id = keyColumn.map(id => row.getAs[Any](id)).map(_.toString).getOrElse(uuid())
+    dataKey(tableName(), partitionId, id)
+  }
+
+  /**
+    * @return table name
+    */
+  private def tableName(): String = {
+    tableNameOpt.getOrElse(throw new IllegalArgumentException(s"Option '$SqlOptionTableName' is not set."))
   }
 
   /**
@@ -484,7 +535,7 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
       }
 
       // TODO: optimize .count() operation
-        def readBlocks(): Seq[Row] = {
+      def readBlocks(): Seq[Row] = {
         var finalRowsList: List[Row] = List()
         val kryo = KryoUtils.Pool.borrow()
         val rowSerializer = new RowSerializer(schema)
@@ -492,11 +543,13 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
         kryo.register(RowClass)
         kryo.register(GenericRowClass)
 
+        var numCols: Integer = schema.size
+
 
         // TODO:
         def project(fullRow: Row, requiredSchema: StructType): Row = {
           val cols = requiredSchema.fieldNames.map(fieldName => fullRow.getAs[Any](fieldName))
-          new GenericRowWithSchema(cols,schema)
+          new GenericRowWithSchema(cols, schema)
         }
 
         val sw1 = new StopWatch()
@@ -512,12 +565,11 @@ class RedisSourceRelation(override val sqlContext: SQLContext,
             val swKryo = new StopWatch()
             val input = new Input(bytes)
             input.setPosition(0)
-            var numRows : Integer = input.readInt()
+            var numRows: Integer = input.readInt()
             logInfo(f"reading $numRows rows from redis with available bytes ${input.available}")
             for (rowNumber <- 0 until numRows) {
-//              logInfo(f"reading row $rowNumber")
-              val deserializedRow = rowSerializer.read(kryo,input,RowClass)
-              //val deserializedRow = kryo.readObject(input, RowClass)
+              //              logInfo(f"reading row $rowNumber")
+              val deserializedRow = rowSerializer.read(kryo, input, RowClass)
               val row = if (projectionRequired) {
                 project(deserializedRow, requiredSchema)
               } else {

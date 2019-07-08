@@ -34,4 +34,6 @@ package object redis {
   val SqlOptionBlockSizeDefault = 1000
   val SqlOptionRedisKryoSerializerBufferSizeKB = "kryoserializer.buffer.kb"
   val SqlOptionRedisKryoSerializerBufferSizeKBDefault = 2
+  val SqlOptionRowThreadPoolSize = "row.threadPool.size"
+  val SqlOptionRowThreadPoolSizeDefault = 1
 }
